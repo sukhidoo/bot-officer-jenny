@@ -4,18 +4,23 @@
 //
 //  Flow:
 //   1. New members can only see #welcome (a button-only channel).
-//   2. They click "Start Introduction" -> a modal asks for:
-//        - Pokémon GO name
-//        - Preferred name
-//        - Tell us about you / fun facts
-//   3. After submitting, the bot DMs them to (optionally) add a meetup photo.
-//   4. On finish: the bot grants the "Verified Member" role (unlocking the
-//      server) AND posts a nicely formatted intro card in #introductions.
+//   2. "Start Introduction" -> a modal asks for PoGo name / preferred name /
+//      fun facts, then a DM for an optional meetup photo.
+//   3. On finish: swap "Rookie Trainer" -> "Ace Trainer" (unlocks the server)
+//      and post a formatted intro card in #introductions.
+//   4. "Edit my intro card" (in #edit-intro-card) lets a member update their
+//      card later — the bot edits their ORIGINAL card in place.
+//
+//  Card ownership (which message belongs to whom) is stored in data/intros.json
+//  so edits survive bot restarts.
 //
 //  See README.md for full setup (intents, role/channel permissions, .env).
 // ============================================================================
 
 require('dotenv').config();
+
+const fs = require('fs');
+const path = require('path');
 
 const {
   Client,
@@ -45,7 +50,7 @@ const CONFIG = {
   aceRoleId: process.env.ACE_ROLE_ID,       // granted on completion (unlocks the server)
   introChannelId: process.env.INTRO_CHANNEL_ID,
   // How long (ms) to wait for the optional DM photo before finishing anyway.
-  photoTimeoutMs: 120_000,
+  photoTimeoutMs: 300_000,
   // Visual accent for the intro embed.
   embedColor: 0x3ba55d,
 };
@@ -66,18 +71,54 @@ for (const [key, val] of Object.entries({
 // Custom IDs used to route component/modal interactions.
 const IDS = {
   startButton: 'intro:start',
-  modal: 'intro:modal',
+  editButton: 'intro:edit',
+  modal: 'intro:modal',           // create flow
+  editModal: 'intro:editmodal',   // edit flow
   skipPhotoButton: 'intro:skipphoto',
   field: { pogo: 'pogo', preferred: 'preferred', facts: 'facts' },
 };
 
 // ----------------------------------------------------------------------------
-//  In-memory state
-//  Holds answers between the modal submit and the optional photo step.
-//  NOTE: this is intentionally simple — if the bot restarts mid-onboarding,
-//  the user just clicks the button again. For most communities that's fine.
+//  Persistent store: userId -> { messageId, pogoName, preferredName,
+//                                funFacts, photoName }
+//  A small JSON file on disk so intro cards can be edited after a restart.
 // ----------------------------------------------------------------------------
-const pending = new Map(); // userId -> { pogoName, preferredName, funFacts, modalInteraction, dmCollector, finalized }
+const DATA_DIR = path.join(__dirname, 'data');
+const STORE_PATH = path.join(DATA_DIR, 'intros.json');
+
+function loadStore() {
+  try {
+    return JSON.parse(fs.readFileSync(STORE_PATH, 'utf8'));
+  } catch {
+    return {}; // file doesn't exist yet / unreadable -> start empty
+  }
+}
+function saveStore(store) {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(STORE_PATH, JSON.stringify(store, null, 2));
+  } catch (err) {
+    console.error('Could not write intro store:', err);
+  }
+}
+function getRecord(userId) {
+  return loadStore()[userId] || null;
+}
+function setRecord(userId, rec) {
+  const store = loadStore();
+  store[userId] = { ...(store[userId] || {}), ...rec };
+  saveStore(store);
+}
+function deleteRecord(userId) {
+  const store = loadStore();
+  delete store[userId];
+  saveStore(store);
+}
+
+// ----------------------------------------------------------------------------
+//  In-memory state: holds answers between the modal submit and the photo step.
+// ----------------------------------------------------------------------------
+const pending = new Map(); // userId -> { mode, pogoName, ..., modalInteraction, dmCollector, finalized }
 
 // ----------------------------------------------------------------------------
 //  Client
@@ -88,33 +129,44 @@ const client = new Client({
     GatewayIntentBits.GuildMembers, // privileged: "Server Members Intent" (role mgmt)
     GatewayIntentBits.DirectMessages, // to receive the photo DM
   ],
-  // Partials let us handle DM channels/messages that aren't cached yet.
   partials: [Partials.Channel, Partials.Message],
 });
 
 // ----------------------------------------------------------------------------
-//  Ready: register the /setup-intro slash command for the guild
+//  Ready: register the slash commands for the guild
 // ----------------------------------------------------------------------------
 client.once(Events.ClientReady, async (c) => {
   console.log(`Logged in as ${c.user.tag}`);
 
-  const setupCmd = new SlashCommandBuilder()
-    .setName('setup-intro')
-    .setDescription('Post the introduction panel (button) in this channel.')
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild);
+  const commands = [
+    new SlashCommandBuilder()
+      .setName('setup-intro')
+      .setDescription('Post the introduction panel (button) in this channel.')
+      .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+    new SlashCommandBuilder()
+      .setName('setup-edit')
+      .setDescription('Post the "edit my intro card" panel in this channel.')
+      .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+    new SlashCommandBuilder()
+      .setName('reset-card')
+      .setDescription('Admin: reset a member — delete their intro card and send them back to Rookie Trainer.')
+      .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+      .addUserOption((opt) =>
+        opt.setName('member').setDescription('The member to reset').setRequired(true)
+      ),
+  ];
 
   try {
     const guild = await c.guilds.fetch(CONFIG.guildId);
-    await guild.commands.set([setupCmd.toJSON()]);
-    console.log('Registered /setup-intro for guild', CONFIG.guildId);
+    await guild.commands.set(commands.map((cmd) => cmd.toJSON()));
+    console.log('Registered /setup-intro and /setup-edit for guild', CONFIG.guildId);
   } catch (err) {
-    console.error('Failed to register slash command:', err);
+    console.error('Failed to register slash commands:', err);
   }
 });
 
 // ----------------------------------------------------------------------------
 //  New member joins -> give them the "Rookie Trainer" role (the gated state)
-//  Requires the Server Members Intent (already enabled below).
 // ----------------------------------------------------------------------------
 client.on(Events.GuildMemberAdd, async (member) => {
   if (member.guild.id !== CONFIG.guildId || member.user.bot) return;
@@ -130,17 +182,19 @@ client.on(Events.GuildMemberAdd, async (member) => {
 // ----------------------------------------------------------------------------
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
-    if (interaction.isChatInputCommand() && interaction.commandName === 'setup-intro') {
-      return handleSetup(interaction);
+    if (interaction.isChatInputCommand()) {
+      if (interaction.commandName === 'setup-intro') return handleSetup(interaction, 'create');
+      if (interaction.commandName === 'setup-edit') return handleSetup(interaction, 'edit');
+      if (interaction.commandName === 'reset-card') return handleResetCard(interaction);
     }
-    if (interaction.isButton() && interaction.customId === IDS.startButton) {
-      return handleStartButton(interaction);
+    if (interaction.isButton()) {
+      if (interaction.customId === IDS.startButton) return handleStartButton(interaction);
+      if (interaction.customId === IDS.editButton) return handleEditButton(interaction);
+      if (interaction.customId === IDS.skipPhotoButton) return handleSkipPhoto(interaction);
     }
-    if (interaction.isModalSubmit() && interaction.customId === IDS.modal) {
-      return handleModalSubmit(interaction);
-    }
-    if (interaction.isButton() && interaction.customId === IDS.skipPhotoButton) {
-      return handleSkipPhoto(interaction);
+    if (interaction.isModalSubmit()) {
+      if (interaction.customId === IDS.modal) return handleModalSubmit(interaction, 'create');
+      if (interaction.customId === IDS.editModal) return handleModalSubmit(interaction, 'edit');
     }
   } catch (err) {
     console.error('Interaction handler error:', err);
@@ -153,31 +207,39 @@ client.on(Events.InteractionCreate, async (interaction) => {
 });
 
 // ----------------------------------------------------------------------------
-//  /setup-intro  -> posts the welcome panel with the Start button
+//  /setup-intro and /setup-edit -> post the appropriate panel + button
 // ----------------------------------------------------------------------------
-async function handleSetup(interaction) {
+async function handleSetup(interaction, mode) {
+  const isEdit = mode === 'edit';
+
   const embed = new EmbedBuilder()
     .setColor(CONFIG.embedColor)
-    .setTitle('👋 Welcome, Trainer!')
+    .setTitle(isEdit ? '✏️ Update Your Intro Card' : '👋 Welcome, Trainer!')
     .setDescription(
-      [
-        'To unlock the rest of the server, introduce yourself.',
-        '',
-        'Click the button below and tell us:',
-        '• Your **Pokémon GO** name',
-        '• What you’d like to be **called** (e.g. John)',
-        '• A few **fun facts** about you',
-        '',
-        'You’ll also get the option to add a photo so people can recognize you at meetups. 📸',
-      ].join('\n')
+      isEdit
+        ? [
+            'Want to change your Pokémon GO name, what we call you, your fun',
+            'facts, or your meetup photo? Click below — your current details will',
+            'be pre-filled so you only change what you want.',
+          ].join('\n')
+        : [
+            'To unlock the rest of the server, introduce yourself.',
+            '',
+            'Click the button below and tell us:',
+            '• Your **Pokémon GO** name',
+            '• What you’d like to be **called** (e.g. John)',
+            '• A few **fun facts** about you',
+            '',
+            'You’ll also get the option to add a photo so people can recognize you at meetups. 📸',
+          ].join('\n')
     );
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
-      .setCustomId(IDS.startButton)
-      .setLabel('Start Introduction')
-      .setEmoji('📝')
-      .setStyle(ButtonStyle.Success)
+      .setCustomId(isEdit ? IDS.editButton : IDS.startButton)
+      .setLabel(isEdit ? 'Edit my intro card' : 'Start Introduction')
+      .setEmoji(isEdit ? '✏️' : '📝')
+      .setStyle(isEdit ? ButtonStyle.Primary : ButtonStyle.Success)
   );
 
   await interaction.channel.send({ embeds: [embed], components: [row] });
@@ -185,20 +247,74 @@ async function handleSetup(interaction) {
 }
 
 // ----------------------------------------------------------------------------
-//  Start button -> show the modal (unless already verified)
+//  /reset-card  (admin) -> delete a member's card + send them back to Rookie
 // ----------------------------------------------------------------------------
-async function handleStartButton(interaction) {
-  if (!interaction.inGuild()) return;
+async function handleResetCard(interaction) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-  const alreadyVerified = interaction.member.roles.cache.has(CONFIG.aceRoleId);
-  if (alreadyVerified) {
-    return interaction.reply({
-      content: 'You’re already verified — you have full access. 🎉',
-      flags: MessageFlags.Ephemeral,
-    });
+  const target = interaction.options.getUser('member');
+  if (target.bot) {
+    return interaction.editReply('That’s a bot — nothing to reset. 🤖');
   }
 
-  const modal = new ModalBuilder().setCustomId(IDS.modal).setTitle('Introduce Yourself');
+  const guild = interaction.guild;
+  const member = await guild.members.fetch(target.id).catch(() => null);
+  const steps = [];
+
+  // 1) Swap roles back: remove Ace Trainer, add Rookie Trainer.
+  if (member) {
+    try {
+      await member.roles.add(CONFIG.rookieRoleId, `Card reset by ${interaction.user.tag}`);
+      if (member.roles.cache.has(CONFIG.aceRoleId)) {
+        await member.roles.remove(CONFIG.aceRoleId, `Card reset by ${interaction.user.tag}`);
+      }
+      steps.push('🔁 Roles set back to **Rookie Trainer**.');
+    } catch (err) {
+      console.error('Reset: role swap failed:', err);
+      steps.push('⚠️ Could not change roles (check the bot’s role is above both, and Manage Roles).');
+    }
+  } else {
+    steps.push('ℹ️ That user isn’t in the server, so no roles were changed.');
+  }
+
+  // 2) Delete their intro card from #introductions, if we have it on record.
+  const record = getRecord(target.id);
+  if (record?.messageId) {
+    try {
+      const introChannel = await guild.channels.fetch(CONFIG.introChannelId);
+      const msg = await introChannel.messages.fetch(record.messageId);
+      await msg.delete();
+      steps.push('🗑️ Their intro card was deleted.');
+    } catch {
+      steps.push('ℹ️ Couldn’t find their card to delete (it may already be gone).');
+    }
+  } else {
+    steps.push('ℹ️ No saved intro card was on record for them.');
+  }
+
+  // 3) Clear their saved record + any in-progress onboarding state.
+  deleteRecord(target.id);
+  pending.delete(target.id);
+
+  // 4) Let the member know (best effort).
+  target
+    .send(
+      'A server admin has reset your introduction. Head back to the welcome ' +
+        'channel when you have a moment to re-introduce yourself. 🙂'
+    )
+    .catch(() => {});
+
+  await interaction.editReply(`Reset complete for <@${target.id}>:\n${steps.join('\n')}`);
+}
+
+// ----------------------------------------------------------------------------
+//  Build the intro modal, optionally pre-filled (for edits)
+// ----------------------------------------------------------------------------
+function buildIntroModal(mode, prefill = {}) {
+  const isEdit = mode === 'edit';
+  const modal = new ModalBuilder()
+    .setCustomId(isEdit ? IDS.editModal : IDS.modal)
+    .setTitle(isEdit ? 'Edit Your Intro' : 'Introduce Yourself');
 
   const pogo = new TextInputBuilder()
     .setCustomId(IDS.field.pogo)
@@ -224,22 +340,61 @@ async function handleStartButton(interaction) {
     .setMaxLength(1000)
     .setRequired(true);
 
+  if (prefill.pogoName) pogo.setValue(prefill.pogoName);
+  if (prefill.preferredName) preferred.setValue(prefill.preferredName);
+  if (prefill.funFacts) facts.setValue(prefill.funFacts);
+
   modal.addComponents(
     new ActionRowBuilder().addComponents(pogo),
     new ActionRowBuilder().addComponents(preferred),
     new ActionRowBuilder().addComponents(facts)
   );
-
-  await interaction.showModal(modal);
+  return modal;
 }
 
 // ----------------------------------------------------------------------------
-//  Modal submit -> stash answers, then DM for the optional photo
+//  Start button -> show the modal (unless already verified)
 // ----------------------------------------------------------------------------
-async function handleModalSubmit(interaction) {
+async function handleStartButton(interaction) {
+  if (!interaction.inGuild()) return;
+
+  if (interaction.member.roles.cache.has(CONFIG.aceRoleId)) {
+    return interaction.reply({
+      content: 'You’re already verified — you have full access. 🎉 ' +
+        'Want to change your card? Use the **Edit my intro card** button.',
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  await interaction.showModal(buildIntroModal('create'));
+}
+
+// ----------------------------------------------------------------------------
+//  Edit button -> show a pre-filled modal (must already be verified)
+// ----------------------------------------------------------------------------
+async function handleEditButton(interaction) {
+  if (!interaction.inGuild()) return;
+
+  if (!interaction.member.roles.cache.has(CONFIG.aceRoleId)) {
+    return interaction.reply({
+      content: 'You’ll need to introduce yourself first in the welcome channel before you can edit a card. 🙂',
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  const existing = getRecord(interaction.user.id) || {};
+  await interaction.showModal(buildIntroModal('edit', existing));
+}
+
+// ----------------------------------------------------------------------------
+//  Modal submit -> stash answers, then DM for the (optional) photo
+// ----------------------------------------------------------------------------
+async function handleModalSubmit(interaction, mode) {
   const userId = interaction.user.id;
+  const isEdit = mode === 'edit';
 
   const entry = {
+    mode,
     pogoName: interaction.fields.getTextInputValue(IDS.field.pogo).trim(),
     preferredName: interaction.fields.getTextInputValue(IDS.field.preferred).trim(),
     funFacts: interaction.fields.getTextInputValue(IDS.field.facts).trim(),
@@ -249,23 +404,25 @@ async function handleModalSubmit(interaction) {
   };
   pending.set(userId, entry);
 
-  // The fallback button lets people with closed DMs finish without a photo.
   const skipRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(IDS.skipPhotoButton)
-      .setLabel('Finish without photo')
+      .setLabel(isEdit ? 'Keep my current photo' : 'Finish without photo')
       .setStyle(ButtonStyle.Secondary)
   );
 
-  // Try to DM for a photo.
+  const dmPrompt = isEdit
+    ? 'Want to change your meetup photo? 📸\n' +
+      '**Upload a new image here** to replace it, or reply **keep** to leave it as-is.\n' +
+      `I’ll wait about ${Math.round(CONFIG.photoTimeoutMs / 1000)} seconds, then save your changes.`
+    : 'Thanks for introducing yourself! 📸\n' +
+      'If you’d like people to recognize you at meetups, **upload a photo here** (just drag an image into this DM).\n' +
+      `Or reply **skip**. I’ll wait about ${Math.round(CONFIG.photoTimeoutMs / 1000)} seconds, then finish you up either way.`;
+
   let dmOk = false;
   try {
     const dm = await interaction.user.createDM();
-    await dm.send(
-      'Thanks for introducing yourself! 📸\n' +
-        'If you’d like people to recognize you at meetups, **upload a photo here** (just drag an image into this DM).\n' +
-        `Or reply **skip**. I’ll wait about ${Math.round(CONFIG.photoTimeoutMs / 1000)} seconds, then finish you up either way.`
-    );
+    await dm.send(dmPrompt);
     dmOk = true;
 
     const collector = dm.createMessageCollector({
@@ -283,52 +440,49 @@ async function handleModalSubmit(interaction) {
         await finalize(userId, img).catch((e) => console.error(e));
         return;
       }
-      if (m.content.trim().toLowerCase() === 'skip') {
+      const word = m.content.trim().toLowerCase();
+      if (word === 'skip' || word === 'keep') {
         collector.stop('skip');
         await finalize(userId, null).catch((e) => console.error(e));
         return;
       }
-      m.reply('Please send an **image**, or reply **skip**.').catch(() => {});
+      m.reply(`Please send an **image**, or reply **${isEdit ? 'keep' : 'skip'}**.`).catch(() => {});
     });
 
     collector.on('end', async (_collected, reason) => {
-      if (reason === 'time') {
-        await finalize(userId, null).catch((e) => console.error(e));
-      }
+      if (reason === 'time') await finalize(userId, null).catch((e) => console.error(e));
     });
   } catch {
     dmOk = false;
   }
 
-  await interaction.reply({
-    content: dmOk
-      ? 'Almost done! I just **DMed you** to optionally add a meetup photo. ' +
-        'Add one there, or use the button below to finish now.'
-      : 'I couldn’t DM you (your DMs may be closed), so I’ll skip the photo step. ' +
-        'Click below to finish and unlock the server.',
-    components: [skipRow],
-    flags: MessageFlags.Ephemeral,
-  });
+  const ephemeral = isEdit
+    ? dmOk
+      ? 'I just **DMed you** to optionally change your photo. Update it there, or use the button below to keep your current one.'
+      : 'I couldn’t DM you (your DMs may be closed), so I’ll keep your current photo. Click below to save your changes.'
+    : dmOk
+      ? 'Almost done! I just **DMed you** to optionally add a meetup photo. Add one there, or use the button below to finish now.'
+      : 'I couldn’t DM you (your DMs may be closed), so I’ll skip the photo step. Click below to finish and unlock the server.';
+
+  await interaction.reply({ content: ephemeral, components: [skipRow], flags: MessageFlags.Ephemeral });
 }
 
 // ----------------------------------------------------------------------------
-//  "Finish without photo" fallback button
+//  Skip / Keep button
 // ----------------------------------------------------------------------------
 async function handleSkipPhoto(interaction) {
   const entry = pending.get(interaction.user.id);
   if (!entry || entry.finalized) {
-    return interaction.reply({
-      content: 'Looks like you’re already set! 🎉',
-      flags: MessageFlags.Ephemeral,
-    });
+    return interaction.reply({ content: 'Looks like you’re already set! 🎉', flags: MessageFlags.Ephemeral });
   }
   entry.dmCollector?.stop('skip-button');
-  await interaction.update({ content: 'Finishing up… ✅', components: [] });
+  await interaction.update({ content: 'Saving… ✅', components: [] });
   await finalize(interaction.user.id, null);
 }
 
 // ----------------------------------------------------------------------------
-//  Finalize: grant role + post the intro card. Runs at most once per user.
+//  Finalize: post a NEW card, or EDIT the member's existing one in place.
+//  Runs at most once per pending entry.
 // ----------------------------------------------------------------------------
 async function finalize(userId, photoAttachment) {
   const entry = pending.get(userId);
@@ -336,6 +490,7 @@ async function finalize(userId, photoAttachment) {
   entry.finalized = true;
   entry.dmCollector?.stop();
 
+  const isEdit = entry.mode === 'edit';
   const guild = await client.guilds.fetch(CONFIG.guildId);
   const member = await guild.members.fetch(userId).catch(() => null);
   if (!member) {
@@ -343,23 +498,24 @@ async function finalize(userId, photoAttachment) {
     return;
   }
 
-  // 1) Swap roles: grant "Ace Trainer" (unlocks server), remove "Rookie Trainer".
-  try {
-    await member.roles.add(CONFIG.aceRoleId, 'Completed onboarding');
-    if (member.roles.cache.has(CONFIG.rookieRoleId)) {
-      await member.roles.remove(CONFIG.rookieRoleId, 'Completed onboarding');
+  // Role swap only happens on first-time onboarding.
+  if (!isEdit) {
+    try {
+      await member.roles.add(CONFIG.aceRoleId, 'Completed onboarding');
+      if (member.roles.cache.has(CONFIG.rookieRoleId)) {
+        await member.roles.remove(CONFIG.rookieRoleId, 'Completed onboarding');
+      }
+    } catch (err) {
+      console.error('Could not swap roles (check hierarchy / Manage Roles perm):', err);
     }
-  } catch (err) {
-    console.error('Could not swap roles (check hierarchy / Manage Roles perm):', err);
   }
 
-  // 2) Build the intro card.
+  const existing = getRecord(userId); // may be null (first card, or pre-update member)
+
+  // Build the card.
   const embed = new EmbedBuilder()
     .setColor(CONFIG.embedColor)
-    .setAuthor({
-      name: member.user.tag,
-      iconURL: member.user.displayAvatarURL(),
-    })
+    .setAuthor({ name: member.user.tag, iconURL: member.user.displayAvatarURL() })
     .setTitle(`👋 Meet ${entry.preferredName}`)
     .setDescription(`<@${userId}>`)
     .addFields(
@@ -367,38 +523,75 @@ async function finalize(userId, photoAttachment) {
       { name: 'Call Me', value: codeSafe(entry.preferredName), inline: true },
       { name: 'About', value: entry.funFacts || '—' }
     )
-    .setFooter({ text: 'New trainer onboarded' })
+    .setFooter({ text: isEdit ? 'Intro updated' : 'New trainer onboarded' })
     .setTimestamp();
 
-  const messageOptions = {
-    embeds: [embed],
-    // Never let user-provided text ping @everyone/roles; user mention won't notify either.
-    allowedMentions: { parse: [] },
-  };
-
-  // Attach the meetup photo (re-uploaded so the link never expires).
+  // Photo handling.
+  //  - new photo uploaded  -> attach it (replace any existing)
+  //  - no new photo + edit + had a photo -> keep the existing attachment
+  //  - otherwise -> no image
+  let photoName = null;
+  let newFile = null;
   if (photoAttachment) {
     const ext = (photoAttachment.name?.match(/\.(png|jpe?g|gif|webp)$/i) || ['', 'png'])[1] || 'png';
-    const file = new AttachmentBuilder(photoAttachment.url, { name: `meetup-photo.${ext}` });
-    embed.setImage(`attachment://meetup-photo.${ext}`);
-    messageOptions.files = [file];
+    photoName = `meetup-photo.${ext}`;
+    newFile = new AttachmentBuilder(photoAttachment.url, { name: photoName });
+    embed.setImage(`attachment://${photoName}`);
+  } else if (existing?.photoName) {
+    photoName = existing.photoName;
+    embed.setImage(`attachment://${photoName}`); // references the kept attachment
   }
 
-  // 3) Post it.
+  // Post a new message or edit the existing one in place.
+  let messageId = existing?.messageId || null;
   try {
     const introChannel = await guild.channels.fetch(CONFIG.introChannelId);
-    await introChannel.send(messageOptions);
+    let edited = false;
+
+    if (messageId) {
+      try {
+        const msg = await introChannel.messages.fetch(messageId);
+        const opts = { embeds: [embed], allowedMentions: { parse: [] } };
+        if (newFile) {
+          opts.files = [newFile]; // add new photo
+          opts.attachments = [];  // and drop the old one
+        } // else: omit files/attachments -> existing attachment is retained
+        await msg.edit(opts);
+        edited = true;
+      } catch {
+        messageId = null; // old card was deleted -> fall through to posting fresh
+      }
+    }
+
+    if (!edited) {
+      const opts = { embeds: [embed], allowedMentions: { parse: [] } };
+      if (newFile) opts.files = [newFile];
+      const posted = await introChannel.send(opts);
+      messageId = posted.id;
+    }
   } catch (err) {
-    console.error('Could not post to intro channel:', err);
+    console.error('Could not post/edit intro card:', err);
   }
 
-  // 4) Confirm to the user, and tidy up the ephemeral reply.
-  member.user
-    .send('You’re all set — welcome to the community! 🎉 You now have full access to the server.')
-    .catch(() => {});
-  entry.modalInteraction
-    ?.editReply({ content: 'Done! You’ve been verified and your intro is posted. 🎉', components: [] })
-    .catch(() => {});
+  // Persist the record so future edits land on the same message.
+  setRecord(userId, {
+    messageId,
+    pogoName: entry.pogoName,
+    preferredName: entry.preferredName,
+    funFacts: entry.funFacts,
+    photoName,
+  });
+
+  // Confirm to the member, tidy the ephemeral reply.
+  const dmMsg = isEdit
+    ? 'Your intro card has been updated! ✨'
+    : 'You’re all set — welcome to the community! 🎉 You now have full access to the server.';
+  const replyMsg = isEdit
+    ? 'Updated your intro card. ✨'
+    : 'Done! You’ve been verified and your intro is posted. 🎉';
+
+  member.user.send(dmMsg).catch(() => {});
+  entry.modalInteraction?.editReply({ content: replyMsg, components: [] }).catch(() => {});
 
   pending.delete(userId);
 }
@@ -406,7 +599,6 @@ async function finalize(userId, photoAttachment) {
 // ----------------------------------------------------------------------------
 //  Helpers
 // ----------------------------------------------------------------------------
-// Wrap short values in inline code so stray markdown/mentions can't break layout.
 function codeSafe(str) {
   const cleaned = (str || '—').replace(/`/g, "'");
   return `\`${cleaned}\``;
