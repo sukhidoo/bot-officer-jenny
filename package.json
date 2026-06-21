@@ -1,0 +1,17 @@
+{
+  "name": "pogo-gatekeeper-bot",
+  "version": "1.0.0",
+  "description": "Discord onboarding gatekeeper bot for a Pokémon GO community",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.0",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
